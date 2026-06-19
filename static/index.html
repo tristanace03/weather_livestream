@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Severe Weather Monitor</title>
+
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+<style>
+  /* ---- design tokens -------------------------------------------------- */
+  :root{
+    --bg:        #05080c;
+    --panel:     rgba(9, 13, 19, 0.82);
+    --edge:      #1c2530;
+    --text:      #e9eef4;
+    --muted:     #7e8b99;
+    --live:      #ff4d4d;
+    --display:   'Barlow Condensed', system-ui, sans-serif;
+    --mono:      'IBM Plex Mono', ui-monospace, monospace;
+  }
+
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ height:100%; background:var(--bg); color:var(--text);
+             font-family:var(--display); overflow:hidden; }
+  #map{ position:absolute; inset:0; }
+
+  /* maplibre attribution: quiet it down to fit the dark broadcast look */
+  .maplibregl-ctrl-attrib{ background:rgba(5,8,12,.6)!important; }
+  .maplibregl-ctrl-attrib a{ color:#5d6b7a!important; }
+
+  /* ---- overlay chrome ------------------------------------------------- */
+  .overlay{ position:absolute; z-index:5; }
+
+  /* top-left: identity */
+  .brand{ top:22px; left:24px; }
+  .brand h1{ font-size:30px; font-weight:700; letter-spacing:.14em;
+             text-transform:uppercase; line-height:1; }
+  .brand .sub{ margin-top:6px; font-family:var(--mono); font-size:11px;
+               letter-spacing:.22em; color:var(--muted); text-transform:uppercase; }
+
+  /* top-right: live status + clock */
+  .status{ top:22px; right:24px; display:flex; flex-direction:column;
+           align-items:flex-end; gap:7px; }
+  .pill{ display:flex; align-items:center; gap:9px; padding:8px 14px;
+         background:var(--panel); border:1px solid var(--edge); border-radius:3px;
+         backdrop-filter:blur(6px); }
+  .dot{ width:9px; height:9px; border-radius:50%; background:var(--live);
+        box-shadow:0 0 0 0 rgba(255,77,77,.6); }
+  @media (prefers-reduced-motion: no-preference){
+    .dot.pulsing{ animation:pulse 1.8s ease-out infinite; }
+  }
+  @keyframes pulse{ 70%{ box-shadow:0 0 0 9px rgba(255,77,77,0);} 100%{ box-shadow:0 0 0 0 rgba(255,77,77,0);} }
+  .pill .label{ font-family:var(--mono); font-size:12px; font-weight:600;
+                letter-spacing:.18em; }
+  .clock{ font-family:var(--mono); font-size:26px; font-weight:500;
+          letter-spacing:.04em; line-height:1; }
+  .clock .utc{ font-size:12px; color:var(--muted); margin-left:8px; }
+  .freshness{ font-family:var(--mono); font-size:11px; letter-spacing:.1em;
+              color:var(--muted); text-transform:uppercase; }
+  .freshness.stale{ color:#ffb454; }
+
+  /* left: live warning tally (the signature element) */
+  .tally{ top:118px; left:24px; width:268px; padding:14px 16px 12px;
+          background:var(--panel); border:1px solid var(--edge); border-radius:3px;
+          backdrop-filter:blur(6px); }
+  .tally .head{ font-family:var(--mono); font-size:10px; letter-spacing:.24em;
+                color:var(--muted); text-transform:uppercase; margin-bottom:11px;
+                display:flex; justify-content:space-between; }
+  .row{ display:flex; align-items:center; gap:10px; padding:5px 0;
+        transition:opacity .4s ease; }
+  .row.zero{ opacity:.32; }
+  .row .sw{ width:11px; height:11px; border-radius:2px; flex:none; }
+  .row .name{ flex:1; font-size:15px; font-weight:500; letter-spacing:.02em;
+              white-space:nowrap; }
+  .row .n{ font-family:var(--mono); font-size:15px; font-weight:600;
+           min-width:28px; text-align:right; }
+
+  /* bottom-center: standing disclaimer (on from minute one) */
+  .disclaimer{ bottom:18px; left:50%; transform:translateX(-50%);
+               font-family:var(--mono); font-size:11px; letter-spacing:.14em;
+               color:var(--muted); text-transform:uppercase;
+               background:rgba(5,8,12,.55); padding:6px 14px; border-radius:3px; }
+</style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="overlay brand">
+    <h1>Severe Weather Monitor</h1>
+    <div class="sub">National &middot; Storm-Based Warnings</div>
+  </div>
+
+  <div class="overlay status">
+    <div class="pill">
+      <span id="dot" class="dot pulsing"></span>
+      <span id="statusLabel" class="label">LIVE</span>
+    </div>
+    <div class="clock"><span id="local">--:--:--</span><span id="utc" class="utc">--:-- UTC</span></div>
+    <div id="freshness" class="freshness">awaiting data</div>
+    <div id="radarTime" class="freshness">radar --:--</div>
+  </div>
+
+  <div class="overlay tally">
+    <div class="head"><span>Active Warnings</span><span id="total">0</span></div>
+    <div id="rows"></div>
+  </div>
+
+  <div class="overlay disclaimer">Unofficial &mdash; official warnings at weather.gov</div>
+
+<script>
+  // ---- NWS-conventional warning colors (shared by map + legend) ----------
+  const EVENT_COLORS = {
+    'Tornado Warning':            '#e03131',
+    'Severe Thunderstorm Warning':'#f2b705',
+    'Flash Flood Warning':        '#2f9e44',
+    'Flood Warning':              '#1c7a3f',
+    'Special Marine Warning':     '#e8730c',
+    'Snow Squall Warning':        '#7048e8',
+    'Dust Storm Warning':         '#b08968',
+    'Extreme Wind Warning':       '#c2255c',
+    'Winter Storm Warning':       '#d6549a'
+  };
+  const FALLBACK = '#9aa4af';
+
+  // shorter labels for the tally rows
+  const SHORT = {
+    'Tornado Warning':'Tornado',
+    'Severe Thunderstorm Warning':'Svr Thunderstorm',
+    'Flash Flood Warning':'Flash Flood',
+    'Flood Warning':'Flood',
+    'Special Marine Warning':'Special Marine',
+    'Snow Squall Warning':'Snow Squall',
+    'Dust Storm Warning':'Dust Storm',
+    'Extreme Wind Warning':'Extreme Wind',
+    'Winter Storm Warning':'Winter Storm'
+  };
+
+  // build the maplibre data-driven color expression from the same map
+  const colorExpr = ['match', ['get','event']];
+  for (const [ev, c] of Object.entries(EVENT_COLORS)){ colorExpr.push(ev, c); }
+  colorExpr.push(FALLBACK);
+
+  // ---- map ---------------------------------------------------------------
+  const style = {
+    version: 8,
+    sources: {
+      carto: {
+        type: 'raster',
+        tiles: [
+          'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+          'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+          'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+          'https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+        ],
+        tileSize: 256,
+        attribution: '&copy; OpenStreetMap &copy; CARTO'
+      }
+    },
+    layers: [{ id:'carto', type:'raster', source:'carto' }]
+  };
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    style,
+    center: [-98.5, 39.5],   // CONUS
+    zoom: 4.2,
+    attributionControl: false,
+    dragRotate: false,
+    interactive: false        // broadcast canvas - no accidental panning.
+                              // Step 3's engine will drive it via map.flyTo().
+  });
+  map.addControl(new maplibregl.AttributionControl({ compact: true }));
+
+  const EMPTY = { type:'FeatureCollection', features:[] };
+
+  map.on('load', () => {
+    map.addSource('alerts', { type:'geojson', data: EMPTY });
+    map.addLayer({ id:'alerts-fill', type:'fill', source:'alerts',
+      paint:{ 'fill-color':colorExpr, 'fill-opacity':0.32 } });
+    map.addLayer({ id:'alerts-line', type:'line', source:'alerts',
+      paint:{ 'line-color':colorExpr, 'line-width':1.6, 'line-opacity':0.9 } });
+
+    loadRadar();                            // Step 2: looping radar under warnings
+    setInterval(loadRadar, 8 * 60 * 1000);  // re-fetch the frame list every 8 min
+    refresh();
+    setInterval(refresh, 30000);
+  });
+
+  // ---- live data ---------------------------------------------------------
+  let lastUpdated = null;
+  let connected = false;
+
+  async function refresh(){
+    try{
+      const r = await fetch('/api/alerts', { cache:'no-store' });
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const data = await r.json();
+      if(map.getSource('alerts')) map.getSource('alerts').setData(data);
+      updateTally(data.features || []);
+      lastUpdated = data.updated ? new Date(data.updated) : null;
+      connected = true;
+    }catch(e){
+      connected = false;        // leave the last good frame on screen
+    }
+  }
+
+  function updateTally(features){
+    const counts = {};
+    for(const f of features){
+      const ev = f.properties && f.properties.event;
+      if(ev) counts[ev] = (counts[ev]||0) + 1;
+    }
+    const rows = document.getElementById('rows');
+    rows.innerHTML = '';
+    let total = 0;
+    for(const ev of Object.keys(EVENT_COLORS)){
+      const n = counts[ev] || 0;
+      total += n;
+      const row = document.createElement('div');
+      row.className = 'row' + (n===0 ? ' zero' : '');
+      row.innerHTML =
+        '<span class="sw" style="background:'+EVENT_COLORS[ev]+'"></span>' +
+        '<span class="name">'+ (SHORT[ev]||ev) +'</span>' +
+        '<span class="n">'+ n +'</span>';
+      rows.appendChild(row);
+    }
+    document.getElementById('total').textContent = total;
+  }
+
+  // ---- radar loop (RainViewer - free, no key) ----------------------------
+  const RAINVIEWER    = 'https://api.rainviewer.com/public/weather-maps.json';
+  const RADAR_COLOR   = 6;     // 6=NEXRAD Level-III. Try 2=Universal Blue,
+                               // 4=The Weather Channel, 8=Dark Sky.
+  const RADAR_OPACITY = 0.75;
+  const FRAME_MS      = 450;   // each frame's on-screen time
+  const LOOP_PAUSE_MS = 1300;  // extra hold on the newest frame
+  const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  let radarIds = [], radarTimes = [], frameIdx = 0, radarTimer = null;
+
+  async function loadRadar(){
+    try{
+      const maps = await (await fetch(RAINVIEWER, { cache:'no-store' })).json();
+      const past = (maps.radar && maps.radar.past) || [];
+      if(!past.length) return;
+
+      for(const id of radarIds){                 // tear down old frames
+        if(map.getLayer(id)) map.removeLayer(id);
+        if(map.getSource(id)) map.removeSource(id);
+      }
+      radarIds = []; radarTimes = [];
+
+      // insert radar UNDER the warning fill so polygons stay on top
+      const beforeId = map.getLayer('alerts-fill') ? 'alerts-fill' : undefined;
+      past.forEach((f, i) => {
+        const id = 'radar-' + i;
+        map.addSource(id, { type:'raster', tileSize:256,
+          tiles:[ `${maps.host}${f.path}/256/{z}/{x}/{y}/${RADAR_COLOR}/1_1.png` ] });
+        map.addLayer({ id, type:'raster', source:id,
+          paint:{ 'raster-opacity':0 } }, beforeId);
+        radarIds.push(id); radarTimes.push(f.time);
+      });
+
+      frameIdx = radarIds.length - 1;             // start on the newest frame
+      if(radarTimer) clearTimeout(radarTimer);
+      animateRadar();
+    }catch(e){ /* keep whatever's on screen */ }
+  }
+
+  function showFrame(i){
+    radarIds.forEach((id, j) => {
+      if(map.getLayer(id))
+        map.setPaintProperty(id, 'raster-opacity', j===i ? RADAR_OPACITY : 0);
+    });
+    const t = new Date(radarTimes[i] * 1000);
+    document.getElementById('radarTime').textContent =
+      'RADAR ' + pad(t.getHours()) + ':' + pad(t.getMinutes());
+  }
+
+  function animateRadar(){
+    if(!radarIds.length) return;
+    if(REDUCED){ showFrame(radarIds.length - 1); return; }   // newest frame only
+    showFrame(frameIdx);
+    const newest = frameIdx === radarIds.length - 1;
+    frameIdx = (frameIdx + 1) % radarIds.length;
+    radarTimer = setTimeout(animateRadar, newest ? LOOP_PAUSE_MS : FRAME_MS);
+  }
+
+  // ---- clock + freshness (seeds Step 9's stale-feed handling) ------------
+  function pad(n){ return String(n).padStart(2,'0'); }
+
+  function tick(){
+    const now = new Date();
+    document.getElementById('local').textContent =
+      pad(now.getHours())+':'+pad(now.getMinutes())+':'+pad(now.getSeconds());
+    document.getElementById('utc').textContent =
+      pad(now.getUTCHours())+':'+pad(now.getUTCMinutes())+' UTC';
+
+    const dot = document.getElementById('dot');
+    const label = document.getElementById('statusLabel');
+    const fresh = document.getElementById('freshness');
+
+    if(!connected){
+      dot.style.background = '#ffb454'; dot.classList.remove('pulsing');
+      label.textContent = 'RECONNECTING';
+      fresh.textContent = 'connection lost'; fresh.classList.add('stale');
+      return;
+    }
+    if(lastUpdated){
+      const age = Math.round((now - lastUpdated)/1000);
+      const stale = age > 120;     // ~2.5 missed polls
+      dot.style.background = stale ? '#ffb454' : 'var(--live)';
+      dot.classList.toggle('pulsing', !stale);
+      label.textContent = stale ? 'DELAYED' : 'LIVE';
+      fresh.textContent = 'updated ' + (age<2 ? 'just now' : age+'s ago');
+      fresh.classList.toggle('stale', stale);
+    }
+  }
+  setInterval(tick, 1000);
+  tick();
+</script>
+</body>
+</html>
